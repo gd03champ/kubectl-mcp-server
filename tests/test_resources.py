@@ -364,95 +364,105 @@ def _registered_resources():
     return server.resources
 
 
-IN_CLUSTER_CONTEXTS = [{
-    "name": "in-cluster",
-    "cluster": "in-cluster",
-    "user": "service-account",
-    "namespace": "default",
-    "active": True,
-}]
+VALID_KUBECONFIG = """\
+apiVersion: v1
+kind: Config
+clusters:
+- {name: c1, cluster: {server: "https://127.0.0.1:1"}}
+users:
+- {name: u1, user: {token: x}}
+contexts:
+- {name: dev, context: {cluster: c1, user: u1, namespace: apps}}
+- {name: prod, context: {cluster: c1, user: u1}}
+current-context: dev
+"""
+
+NO_CURRENT_CONTEXT_KUBECONFIG = VALID_KUBECONFIG.replace("current-context: dev\n", "")
+
+MALFORMED_KUBECONFIG = "clusters: [ {name: c1\n  bad: : :\n"
+
+CONTEXT_URIS = ("kubeconfig://contexts", "kubeconfig://current-context", "namespace://current")
 
 
-class TestContextResourcesInCluster:
-    """Context resources must work in-cluster, where no kubeconfig file exists."""
+class TestContextResources:
+    """Context resources against real kubeconfig files, plus the in-cluster fallback."""
+
+    @pytest.fixture
+    def kubeconfig(self, tmp_path, monkeypatch):
+        """Point the kubernetes client at a temp kubeconfig; returns a writer."""
+        path = tmp_path / "config"
+        monkeypatch.setattr("kubernetes.config.kube_config.KUBE_CONFIG_DEFAULT_LOCATION", str(path))
+
+        def write(content):
+            path.write_text(content)
+            return path
+
+        return write
+
+    @staticmethod
+    def _read_all():
+        resources = _registered_resources()
+        return [json.loads(resources[uri]()) for uri in CONTEXT_URIS]
 
     @pytest.mark.unit
-    def test_current_context_in_cluster(self):
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
-                patch("kubernetes.config.list_kube_config_contexts",
-                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
-            result = json.loads(resources["kubeconfig://current-context"]())
-
-        assert result == {
-            "name": "in-cluster",
-            "cluster": "in-cluster",
-            "user": "service-account",
-            "namespace": "default",
-        }
-
-    @pytest.mark.unit
-    def test_kubeconfig_contexts_in_cluster(self):
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
-                patch("kubernetes.config.list_kube_config_contexts",
-                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
-            result = json.loads(resources["kubeconfig://contexts"]())
-
-        assert result["active_context"] == "in-cluster"
-        assert [c["name"] for c in result["contexts"]] == ["in-cluster"]
-
-    @pytest.mark.unit
-    def test_current_namespace_in_cluster(self):
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
-                patch("kubernetes.config.list_kube_config_contexts",
-                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
-            result = json.loads(resources["namespace://current"]())
-
-        assert result == {"namespace": "default"}
-
-    @pytest.mark.unit
-    def test_kubeconfig_contexts_from_kubeconfig(self):
-        contexts = [
-            {"name": "dev", "cluster": "dev-cluster", "user": "dev-user", "namespace": "apps", "active": True},
-            {"name": "prod", "cluster": "prod-cluster", "user": "prod-user", "namespace": None, "active": False},
-        ]
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=contexts):
-            listed = json.loads(resources["kubeconfig://contexts"]())
-            current = json.loads(resources["kubeconfig://current-context"]())
-            namespace = json.loads(resources["namespace://current"]())
+    def test_valid_kubeconfig(self, kubeconfig):
+        kubeconfig(VALID_KUBECONFIG)
+        listed, current, namespace = self._read_all()
 
         assert listed["active_context"] == "dev"
+        assert [c["name"] for c in listed["contexts"]] == ["dev", "prod"]
         assert listed["contexts"][1]["namespace"] == "default"
-        assert current["name"] == "dev"
+        assert current == {"name": "dev", "cluster": "c1", "user": "u1", "namespace": "apps"}
         assert namespace == {"namespace": "apps"}
 
     @pytest.mark.unit
-    def test_no_active_context(self):
-        contexts = [
-            {"name": "dev", "cluster": "dev-cluster", "user": "dev-user", "namespace": "apps", "active": False},
-        ]
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=contexts):
-            listed = json.loads(resources["kubeconfig://contexts"]())
-            current = json.loads(resources["kubeconfig://current-context"]())
-            namespace = json.loads(resources["namespace://current"]())
+    def test_in_cluster_without_kubeconfig(self, kubeconfig):
+        """The reported bug: in a pod with a ServiceAccount and no kubeconfig."""
+        with patch("kubernetes.config.load_incluster_config") as load_incluster:
+            listed, current, namespace = self._read_all()
 
-        assert listed["active_context"] is None
-        assert current == {"error": "No active context found"}
+        in_cluster = {"name": "in-cluster", "cluster": "in-cluster", "user": "service-account", "namespace": "default"}
+        assert listed == {"active_context": "in-cluster", "contexts": [in_cluster]}
+        assert current == in_cluster
         assert namespace == {"namespace": "default"}
+        # The probe must not replace the global default client configuration.
+        for call in load_incluster.call_args_list:
+            assert call.kwargs.get("client_configuration") is not None
 
     @pytest.mark.unit
-    def test_missing_configuration_reports_error(self):
-        """No kubeconfig and no in-cluster config must surface an error, not defaults."""
-        resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=[]):
-            results = [
-                json.loads(resources[uri]())
-                for uri in ("kubeconfig://contexts", "kubeconfig://current-context", "namespace://current")
-            ]
-
+    def test_no_kubeconfig_and_not_in_cluster(self, kubeconfig):
+        results = self._read_all()
         for result in results:
-            assert "No Kubernetes configuration found" in result["error"]
+            assert "No configuration found" in result["error"]
+
+    @pytest.mark.unit
+    def test_malformed_kubeconfig_reports_parse_error(self, kubeconfig):
+        kubeconfig(MALFORMED_KUBECONFIG)
+        for result in self._read_all():
+            assert "while parsing" in result["error"]
+
+    @pytest.mark.unit
+    def test_missing_current_context_reports_error(self, kubeconfig):
+        kubeconfig(NO_CURRENT_CONTEXT_KUBECONFIG)
+        for result in self._read_all():
+            assert "current-context" in result["error"]
+
+    @pytest.mark.unit
+    def test_kubeconfig_changes_are_not_cached(self, kubeconfig):
+        """Breaking the kubeconfig after a successful read must surface the error."""
+        kubeconfig(VALID_KUBECONFIG)
+        resources = _registered_resources()
+        assert json.loads(resources["kubeconfig://current-context"]())["name"] == "dev"
+
+        kubeconfig(MALFORMED_KUBECONFIG)
+        for uri in CONTEXT_URIS:
+            assert "while parsing" in json.loads(resources[uri]())["error"]
+
+    @pytest.mark.unit
+    def test_kubeconfig_preferred_over_in_cluster(self, kubeconfig):
+        kubeconfig(VALID_KUBECONFIG)
+        with patch("kubernetes.config.load_incluster_config") as load_incluster:
+            current = json.loads(_registered_resources()["kubeconfig://current-context"]())
+
+        assert current["name"] == "dev"
+        load_incluster.assert_not_called()

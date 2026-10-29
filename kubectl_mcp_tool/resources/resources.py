@@ -14,30 +14,43 @@ def register_resources(server):
     """
 
     def _context_info():
-        """Return (contexts, active) via the provider-aware k8s_config helpers.
+        """Return (contexts, active) for the context/namespace resources.
 
-        Using ``kubernetes.config.list_kube_config_contexts()`` directly only
-        works when a kubeconfig file exists, so these resources failed with
-        "Invalid kube-config file. No configuration found." when the server
-        runs in-cluster with a ServiceAccount. ``k8s_config.list_contexts()``
-        goes through the provider, which reports the synthetic ``in-cluster``
-        context in that case (same as the ``list_contexts`` tool).
-
-        ``list_contexts()`` swallows configuration errors and returns ``[]``.
-        A loadable config always yields at least one context (in-cluster or
-        from kubeconfig), so treat an empty list as a configuration failure
-        rather than reporting plausible defaults.
+        The kubeconfig is read fresh on every call, so edits and errors
+        (missing file, parse errors, missing current-context) are reported
+        as they are. Only when no usable kubeconfig exists and the server is
+        running in a pod with a ServiceAccount does this fall back to the
+        synthetic ``in-cluster`` context, matching the ``list_contexts`` tool.
         """
-        from kubectl_mcp_tool.k8s_config import list_contexts
+        from kubernetes import client, config
 
-        contexts = list_contexts()
-        if not contexts:
-            raise RuntimeError(
-                "No Kubernetes configuration found: no usable kubeconfig "
-                "contexts and in-cluster config is not available."
-            )
-        active = next((ctx for ctx in contexts if ctx.get("active")), None)
-        return contexts, active
+        try:
+            contexts, active = config.list_kube_config_contexts()
+        except Exception as kubeconfig_error:
+            try:
+                # Throwaway Configuration so the probe doesn't change the
+                # global default client config.
+                config.load_incluster_config(client_configuration=client.Configuration())
+            except Exception:
+                raise kubeconfig_error
+            in_cluster = {
+                "name": "in-cluster",
+                "cluster": "in-cluster",
+                "user": "service-account",
+                "namespace": "default",
+            }
+            return [in_cluster], in_cluster
+
+        def _flatten(ctx):
+            details = ctx.get("context", {})
+            return {
+                "name": ctx.get("name"),
+                "cluster": details.get("cluster"),
+                "user": details.get("user"),
+                "namespace": details.get("namespace") or "default",
+            }
+
+        return [_flatten(ctx) for ctx in contexts], (_flatten(active) if active else None)
 
     @server.resource("kubeconfig://contexts")
     def get_kubeconfig_contexts() -> str:
