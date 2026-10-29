@@ -22,10 +22,20 @@ def register_resources(server):
         runs in-cluster with a ServiceAccount. ``k8s_config.list_contexts()``
         goes through the provider, which reports the synthetic ``in-cluster``
         context in that case (same as the ``list_contexts`` tool).
+
+        ``list_contexts()`` swallows configuration errors and returns ``[]``.
+        A loadable config always yields at least one context (in-cluster or
+        from kubeconfig), so treat an empty list as a configuration failure
+        rather than reporting plausible defaults.
         """
         from kubectl_mcp_tool.k8s_config import list_contexts
 
         contexts = list_contexts()
+        if not contexts:
+            raise RuntimeError(
+                "No Kubernetes configuration found: no usable kubeconfig "
+                "contexts and in-cluster config is not available."
+            )
         active = next((ctx for ctx in contexts if ctx.get("active")), None)
         return contexts, active
 

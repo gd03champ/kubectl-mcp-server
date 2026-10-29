@@ -431,10 +431,28 @@ class TestContextResourcesInCluster:
 
     @pytest.mark.unit
     def test_no_active_context(self):
+        contexts = [
+            {"name": "dev", "cluster": "dev-cluster", "user": "dev-user", "namespace": "apps", "active": False},
+        ]
         resources = _registered_resources()
-        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=[]):
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=contexts):
+            listed = json.loads(resources["kubeconfig://contexts"]())
             current = json.loads(resources["kubeconfig://current-context"]())
             namespace = json.loads(resources["namespace://current"]())
 
+        assert listed["active_context"] is None
         assert current == {"error": "No active context found"}
         assert namespace == {"namespace": "default"}
+
+    @pytest.mark.unit
+    def test_missing_configuration_reports_error(self):
+        """No kubeconfig and no in-cluster config must surface an error, not defaults."""
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=[]):
+            results = [
+                json.loads(resources[uri]())
+                for uri in ("kubeconfig://contexts", "kubeconfig://current-context", "namespace://current")
+            ]
+
+        for result in results:
+            assert "No Kubernetes configuration found" in result["error"]
