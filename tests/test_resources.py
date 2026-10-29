@@ -341,3 +341,100 @@ class TestResourceRegistration:
             scheme, path = uri.split("://", 1)
             assert scheme in ["kubeconfig", "namespace", "cluster", "manifest"]
             assert len(path) > 0
+
+
+class _CapturingServer:
+    """Minimal stand-in for FastMCP that records registered resource functions."""
+
+    def __init__(self):
+        self.resources = {}
+
+    def resource(self, uri):
+        def decorator(fn):
+            self.resources[uri] = fn
+            return fn
+        return decorator
+
+
+def _registered_resources():
+    from kubectl_mcp_tool.resources.resources import register_resources
+
+    server = _CapturingServer()
+    register_resources(server)
+    return server.resources
+
+
+IN_CLUSTER_CONTEXTS = [{
+    "name": "in-cluster",
+    "cluster": "in-cluster",
+    "user": "service-account",
+    "namespace": "default",
+    "active": True,
+}]
+
+
+class TestContextResourcesInCluster:
+    """Context resources must work in-cluster, where no kubeconfig file exists."""
+
+    @pytest.mark.unit
+    def test_current_context_in_cluster(self):
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
+                patch("kubernetes.config.list_kube_config_contexts",
+                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
+            result = json.loads(resources["kubeconfig://current-context"]())
+
+        assert result == {
+            "name": "in-cluster",
+            "cluster": "in-cluster",
+            "user": "service-account",
+            "namespace": "default",
+        }
+
+    @pytest.mark.unit
+    def test_kubeconfig_contexts_in_cluster(self):
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
+                patch("kubernetes.config.list_kube_config_contexts",
+                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
+            result = json.loads(resources["kubeconfig://contexts"]())
+
+        assert result["active_context"] == "in-cluster"
+        assert [c["name"] for c in result["contexts"]] == ["in-cluster"]
+
+    @pytest.mark.unit
+    def test_current_namespace_in_cluster(self):
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=IN_CLUSTER_CONTEXTS), \
+                patch("kubernetes.config.list_kube_config_contexts",
+                      side_effect=Exception("Invalid kube-config file. No configuration found.")):
+            result = json.loads(resources["namespace://current"]())
+
+        assert result == {"namespace": "default"}
+
+    @pytest.mark.unit
+    def test_kubeconfig_contexts_from_kubeconfig(self):
+        contexts = [
+            {"name": "dev", "cluster": "dev-cluster", "user": "dev-user", "namespace": "apps", "active": True},
+            {"name": "prod", "cluster": "prod-cluster", "user": "prod-user", "namespace": None, "active": False},
+        ]
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=contexts):
+            listed = json.loads(resources["kubeconfig://contexts"]())
+            current = json.loads(resources["kubeconfig://current-context"]())
+            namespace = json.loads(resources["namespace://current"]())
+
+        assert listed["active_context"] == "dev"
+        assert listed["contexts"][1]["namespace"] == "default"
+        assert current["name"] == "dev"
+        assert namespace == {"namespace": "apps"}
+
+    @pytest.mark.unit
+    def test_no_active_context(self):
+        resources = _registered_resources()
+        with patch("kubectl_mcp_tool.k8s_config.list_contexts", return_value=[]):
+            current = json.loads(resources["kubeconfig://current-context"]())
+            namespace = json.loads(resources["namespace://current"]())
+
+        assert current == {"error": "No active context found"}
+        assert namespace == {"namespace": "default"}

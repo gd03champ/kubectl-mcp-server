@@ -13,20 +13,35 @@ def register_resources(server):
         server: FastMCP server instance
     """
 
+    def _context_info():
+        """Return (contexts, active) via the provider-aware k8s_config helpers.
+
+        Using ``kubernetes.config.list_kube_config_contexts()`` directly only
+        works when a kubeconfig file exists, so these resources failed with
+        "Invalid kube-config file. No configuration found." when the server
+        runs in-cluster with a ServiceAccount. ``k8s_config.list_contexts()``
+        goes through the provider, which reports the synthetic ``in-cluster``
+        context in that case (same as the ``list_contexts`` tool).
+        """
+        from kubectl_mcp_tool.k8s_config import list_contexts
+
+        contexts = list_contexts()
+        active = next((ctx for ctx in contexts if ctx.get("active")), None)
+        return contexts, active
+
     @server.resource("kubeconfig://contexts")
     def get_kubeconfig_contexts() -> str:
         """List all available kubectl contexts."""
         try:
-            from kubernetes import config
-            contexts, active_context = config.list_kube_config_contexts()
+            contexts, active_context = _context_info()
             result = {
                 "active_context": active_context.get("name") if active_context else None,
                 "contexts": [
                     {
                         "name": ctx.get("name"),
-                        "cluster": ctx.get("context", {}).get("cluster"),
-                        "user": ctx.get("context", {}).get("user"),
-                        "namespace": ctx.get("context", {}).get("namespace", "default")
+                        "cluster": ctx.get("cluster"),
+                        "user": ctx.get("user"),
+                        "namespace": ctx.get("namespace") or "default"
                     }
                     for ctx in contexts
                 ]
@@ -39,14 +54,13 @@ def register_resources(server):
     def get_current_context() -> str:
         """Get the current active kubectl context."""
         try:
-            from kubernetes import config
-            _, active_context = config.list_kube_config_contexts()
+            _, active_context = _context_info()
             if active_context:
                 result = {
                     "name": active_context.get("name"),
-                    "cluster": active_context.get("context", {}).get("cluster"),
-                    "user": active_context.get("context", {}).get("user"),
-                    "namespace": active_context.get("context", {}).get("namespace", "default")
+                    "cluster": active_context.get("cluster"),
+                    "user": active_context.get("user"),
+                    "namespace": active_context.get("namespace") or "default"
                 }
             else:
                 result = {"error": "No active context found"}
@@ -58,11 +72,10 @@ def register_resources(server):
     def get_current_namespace() -> str:
         """Get the current namespace from kubectl context."""
         try:
-            from kubernetes import config
-            _, active_context = config.list_kube_config_contexts()
+            _, active_context = _context_info()
             namespace = "default"
             if active_context:
-                namespace = active_context.get("context", {}).get("namespace", "default")
+                namespace = active_context.get("namespace") or "default"
             return json.dumps({"namespace": namespace}, indent=2)
         except Exception as e:
             return json.dumps({"error": str(e)})
