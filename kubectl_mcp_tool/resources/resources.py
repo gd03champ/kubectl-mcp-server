@@ -68,11 +68,11 @@ def register_resources(server):
         if not any(os.path.exists(p) for p in path.split(os.pathsep) if p):
             try:
                 return _in_cluster()
-            except Exception:
+            except Exception as err:
                 raise FileNotFoundError(
                     f"No Kubernetes configuration found: kubeconfig not found at "
                     f"'{path}' and in-cluster config is not available."
-                )
+                ) from err
 
         contexts, active = config.list_kube_config_contexts(config_file=path)
         return [_flatten(ctx) for ctx in contexts], (_flatten(active) if active else None)
