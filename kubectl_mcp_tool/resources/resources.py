@@ -16,30 +16,32 @@ def register_resources(server):
     def _context_info():
         """Return (contexts, active) for the context/namespace resources.
 
-        The kubeconfig is read fresh on every call, so edits and errors
-        (missing file, parse errors, missing current-context) are reported
-        as they are. Only when no usable kubeconfig exists and the server is
-        running in a pod with a ServiceAccount does this fall back to the
-        synthetic ``in-cluster`` context, matching the ``list_contexts`` tool.
+        Follows the same selection rules as ``KubernetesProvider``
+        (``MCP_K8S_PROVIDER``, ``MCP_K8S_KUBECONFIG``/``KUBECONFIG``,
+        ``MCP_K8S_CONTEXT``), so resources describe the cluster the tools
+        talk to. The kubeconfig is read on every call, so edits and errors
+        (parse errors, missing current-context) are reported as they are.
+        In-cluster is used for the ``in-cluster`` provider, or for the
+        default provider only when the kubeconfig file does not exist.
         """
+        import os
         from kubernetes import client, config
+        from kubectl_mcp_tool.providers import ProviderConfig, ProviderType
 
-        try:
-            contexts, active = config.list_kube_config_contexts()
-        except Exception as kubeconfig_error:
-            try:
-                # Throwaway Configuration so the probe doesn't change the
-                # global default client config.
-                config.load_incluster_config(client_configuration=client.Configuration())
-            except Exception:
-                raise kubeconfig_error
-            in_cluster = {
+        settings = ProviderConfig.from_env()
+        path = settings.kubeconfig_path
+
+        def _in_cluster():
+            # Throwaway Configuration so the probe doesn't change the
+            # global default client config.
+            config.load_incluster_config(client_configuration=client.Configuration())
+            ctx = {
                 "name": "in-cluster",
                 "cluster": "in-cluster",
                 "user": "service-account",
                 "namespace": "default",
             }
-            return [in_cluster], in_cluster
+            return [ctx], ctx
 
         def _flatten(ctx):
             details = ctx.get("context", {})
@@ -50,6 +52,29 @@ def register_resources(server):
                 "namespace": details.get("namespace") or "default",
             }
 
+        if settings.provider_type == ProviderType.IN_CLUSTER:
+            return _in_cluster()
+
+        if settings.provider_type == ProviderType.SINGLE:
+            if not settings.context:
+                raise ValueError("MCP_K8S_CONTEXT must be set for 'single' provider")
+            contexts, _ = config.list_kube_config_contexts(config_file=path)
+            for ctx in contexts:
+                if ctx.get("name") == settings.context:
+                    single = _flatten(ctx)
+                    return [single], single
+            raise ValueError(f"Context '{settings.context}' not found in kubeconfig '{path}'")
+
+        if not any(os.path.exists(p) for p in path.split(os.pathsep) if p):
+            try:
+                return _in_cluster()
+            except Exception:
+                raise FileNotFoundError(
+                    f"No Kubernetes configuration found: kubeconfig not found at "
+                    f"'{path}' and in-cluster config is not available."
+                )
+
+        contexts, active = config.list_kube_config_contexts(config_file=path)
         return [_flatten(ctx) for ctx in contexts], (_flatten(active) if active else None)
 
     @server.resource("kubeconfig://contexts")

@@ -364,6 +364,8 @@ def _registered_resources():
     return server.resources
 
 
+from kubernetes.config.config_exception import ConfigException
+
 VALID_KUBECONFIG = """\
 apiVersion: v1
 kind: Config
@@ -389,13 +391,18 @@ class TestContextResources:
 
     @pytest.fixture
     def kubeconfig(self, tmp_path, monkeypatch):
-        """Point the kubernetes client at a temp kubeconfig; returns a writer."""
+        """Point the server at a temp kubeconfig (via MCP_K8S_KUBECONFIG); returns a writer."""
         path = tmp_path / "config"
-        monkeypatch.setattr("kubernetes.config.kube_config.KUBE_CONFIG_DEFAULT_LOCATION", str(path))
+        for var in ("MCP_K8S_PROVIDER", "MCP_K8S_CONTEXT", "KUBECONFIG"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("MCP_K8S_KUBECONFIG", str(path))
+        # The client library's own default must not be what gets read.
+        monkeypatch.setattr("kubernetes.config.kube_config.KUBE_CONFIG_DEFAULT_LOCATION",
+                            str(tmp_path / "library-default"))
 
-        def write(content):
-            path.write_text(content)
-            return path
+        def write(content, target=path):
+            target.write_text(content)
+            return target
 
         return write
 
@@ -431,9 +438,10 @@ class TestContextResources:
 
     @pytest.mark.unit
     def test_no_kubeconfig_and_not_in_cluster(self, kubeconfig):
-        results = self._read_all()
+        with patch("kubernetes.config.load_incluster_config", side_effect=ConfigException("not in a pod")):
+            results = self._read_all()
         for result in results:
-            assert "No configuration found" in result["error"]
+            assert "No Kubernetes configuration found" in result["error"]
 
     @pytest.mark.unit
     def test_malformed_kubeconfig_reports_parse_error(self, kubeconfig):
@@ -466,3 +474,59 @@ class TestContextResources:
 
         assert current["name"] == "dev"
         load_incluster.assert_not_called()
+
+    @pytest.mark.unit
+    def test_malformed_kubeconfig_in_pod_is_not_masked(self, kubeconfig):
+        """An existing but broken kubeconfig must not silently become in-cluster."""
+        kubeconfig(MALFORMED_KUBECONFIG)
+        with patch("kubernetes.config.load_incluster_config") as load_incluster:
+            results = self._read_all()
+
+        for result in results:
+            assert "while parsing" in result["error"]
+        load_incluster.assert_not_called()
+
+    @pytest.mark.unit
+    def test_uses_configured_kubeconfig_not_library_default(self, kubeconfig, tmp_path):
+        kubeconfig(VALID_KUBECONFIG)
+        kubeconfig(VALID_KUBECONFIG.replace("current-context: dev", "current-context: prod"),
+                   target=tmp_path / "library-default")
+
+        assert json.loads(_registered_resources()["kubeconfig://current-context"]())["name"] == "dev"
+
+    @pytest.mark.unit
+    def test_in_cluster_provider_ignores_kubeconfig(self, kubeconfig, monkeypatch):
+        kubeconfig(VALID_KUBECONFIG)
+        monkeypatch.setenv("MCP_K8S_PROVIDER", "in-cluster")
+        with patch("kubernetes.config.load_incluster_config"):
+            current = json.loads(_registered_resources()["kubeconfig://current-context"]())
+
+        assert current["name"] == "in-cluster"
+
+    @pytest.mark.unit
+    def test_in_cluster_provider_without_service_account_errors(self, kubeconfig, monkeypatch):
+        monkeypatch.setenv("MCP_K8S_PROVIDER", "in-cluster")
+        with patch("kubernetes.config.load_incluster_config", side_effect=ConfigException("not in a pod")):
+            results = self._read_all()
+        for result in results:
+            assert "not in a pod" in result["error"]
+
+    @pytest.mark.unit
+    def test_single_provider_reports_configured_context(self, kubeconfig, monkeypatch):
+        kubeconfig(VALID_KUBECONFIG)
+        monkeypatch.setenv("MCP_K8S_PROVIDER", "single")
+        monkeypatch.setenv("MCP_K8S_CONTEXT", "prod")
+        listed, current, namespace = self._read_all()
+
+        assert listed["active_context"] == "prod"
+        assert [c["name"] for c in listed["contexts"]] == ["prod"]
+        assert current["name"] == "prod"
+        assert namespace == {"namespace": "default"}
+
+    @pytest.mark.unit
+    def test_single_provider_unknown_context_errors(self, kubeconfig, monkeypatch):
+        kubeconfig(VALID_KUBECONFIG)
+        monkeypatch.setenv("MCP_K8S_PROVIDER", "single")
+        monkeypatch.setenv("MCP_K8S_CONTEXT", "missing")
+        for result in self._read_all():
+            assert "Context 'missing' not found" in result["error"]
